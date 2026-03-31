@@ -1,5 +1,12 @@
 # Profit Mix Optimizer
 
+streamlit
+pandas
+numpy
+scipy
+plotly
+openpyxl
+
 A Streamlit app for optimizing investment fund mixes across savings tracks —
 supporting קרנות השתלמות, פוליסות חיסכון, קרנות פנסיה, קופות גמל, and גמל להשקעה.
 

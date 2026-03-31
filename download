@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Streamlit secrets — לעולם לא לגיטהאב!
+.streamlit/secrets.toml
+
+# Environment variables
+.env
+.env.local
+
+# עורכי קוד
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# מחשב
+.DS_Store
+Thumbs.db
+
+# קבצי backup
+*.bak
+*.orig

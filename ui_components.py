@@ -1,0 +1,1503 @@
+from __future__ import annotations
+# -*- coding: utf-8 -*-
+"""
+ui_components.py — Profit Mix Optimizer
+כל פונקציות ה-render של הממשק.
+"""
+import html, io, math, re
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from loader import (
+    FUNDS_GSHEET_ID, POLICIES_GSHEET_ID, PENSION_GSHEET_ID,
+    GEMEL_GSHEET_ID, GEMEL_INV_GSHEET_ID, SERVICE_GSHEET_ID,
+    load_funds_long,
+)
+from optimizer import (
+    find_best_solutions, _pick_recommendations, _pick_three_distinct,
+    _weights_items, _weights_short, _make_advantage,
+    _weighted_metric_from_items, _compute_weighted_returns_for_items,
+)
+
+def _normalize_series(s):
+    s = pd.to_numeric(s, errors="coerce").fillna(0.0)
+    mn, mx = float(s.min()), float(s.max())
+    if abs(mx - mn) < 1e-12:
+        return pd.Series([0.5] * len(s), index=s.index)
+    return (s - mn) / (mx - mn)
+
+def _pick_recommendations(df_sol_head):
+    if df_sol_head is None or df_sol_head.empty:
+        return {}
+    df = df_sol_head.copy()
+    if "score" not in df.columns:
+        return {}
+
+    accurate = df.loc[df["score"].idxmin()].to_dict()
+
+    # Only use sharpe/service columns if they exist AND have at least one non-NaN value
+    has_sharpe  = "שארפ משוקלל"  in df.columns and df["שארפ משוקלל"].notna().any()
+    has_service = "שירות משוקלל" in df.columns and df["שירות משוקלל"].notna().any()
+
+    best_sh      = df.loc[df["שארפ משוקלל"].idxmax()].to_dict()  if has_sharpe  else accurate
+    best_service = df.loc[df["שירות משוקלל"].idxmax()].to_dict() if has_service else accurate
+
+    score_n   = _normalize_series(df["score"])
+    acc_n     = 1.0 - score_n
+    sharpe_n  = _normalize_series(df["שארפ משוקלל"])  if has_sharpe  else pd.Series([0.0] * len(df), index=df.index)
+    service_n = _normalize_series(df["שירות משוקלל"]) if has_service else pd.Series([0.0] * len(df), index=df.index)
+    df["_weighted_pref"] = 0.45 * acc_n + 0.15 * sharpe_n + 0.40 * service_n
+    weighted = df.loc[df["_weighted_pref"].idxmax()].to_dict()
+
+    return {"weighted": weighted, "accurate": accurate, "sharpe": best_sh, "service": best_service}
+
+def _weighted_metric_from_items(items, df_long, metric_key):
+    """Weighted average of metric_key for a list of fund items.
+    Match: 1) exact fund name  2) fallback manager+track.
+    Returns NaN if no values found."""
+    if not items or df_long is None or df_long.empty:
+        return np.nan
+    total_w = 0.0
+    total_v = 0.0
+    for it in items:
+        try:
+            pct = float(str(it.get("pct", "0")).replace("%", "") or 0)
+        except Exception:
+            continue
+        if pct <= 0:
+            continue
+        fund    = str(it.get("fund",    "")).strip()
+        track   = str(it.get("track",   "")).strip()
+        manager = str(it.get("manager", "")).strip()
+        match = df_long[df_long["fund"].str.strip() == fund] if fund else pd.DataFrame()
+        if match.empty and manager and track:
+            match = df_long[
+                (df_long["manager"].str.strip() == manager) &
+                (df_long["track"].str.strip()   == track)
+            ]
+        if match.empty:
+            continue
+        val = _to_float(match.iloc[0].get(metric_key, np.nan))
+        if math.isnan(val):
+            continue
+        total_w += pct
+        total_v += pct * val
+    return (total_v / total_w) if total_w > 0 else np.nan
+
+def _compute_weighted_returns_for_items(items, df_long):
+    """Return dict of all weighted return metrics for an alternative's items."""
+    return {
+        "ret_ytd": _weighted_metric_from_items(items, df_long, "ret_ytd"),
+        "ret_12m": _weighted_metric_from_items(items, df_long, "ret_12m"),
+        "ret_36m": _weighted_metric_from_items(items, df_long, "ret_36m"),
+        "ret_60m": _weighted_metric_from_items(items, df_long, "ret_60m"),
+    }
+
+def _manager_weights_from_items(items, manager_names):
+    if not items: return []
+    names = sorted([m for m in manager_names if isinstance(m, str) and m.strip()], key=len, reverse=True)
+    agg = {}
+    for it in items:
+        fund = str(it.get("fund",""))
+        pct  = float(str(it.get("pct","0")).replace("%","") or 0)
+        chosen = None
+        for n in names:
+            if fund.strip().startswith(n) or (n in fund.strip()):
+                chosen = n
+                break
+        if chosen is None: chosen = "אחר"
+        agg[chosen] = agg.get(chosen, 0.0) + pct
+    return sorted(agg.items(), key=lambda x: -x[1])
+
+def _change_type_badge(cur_mgrs, prop_mgrs):
+    cur_set  = set(m.strip() for m in cur_mgrs  if m.strip())
+    prop_set = set(m.strip() for m in prop_mgrs if m.strip())
+    if not cur_set:
+        return ""
+    if cur_set == prop_set:
+        return "<span class='change-badge change-low'>✅ שינוי מסלול – אותו מנהל</span>"
+    elif cur_set & prop_set:
+        return "<span class='change-badge change-med'>⚠️ ניוד חלקי</span>"
+    else:
+        return "<span class='change-badge change-high'>🔴 ניוד מלא</span>"
+
+# ─────────────────────────────────────────────
+# AI explanation (Claude API)
+# ─────────────────────────────────────────────
+BAR_COLORS = ["#4f46e5","#2563eb","#0891b2","#7c3aed","#059669","#d97706"]
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _ai_explain(title: str, managers: str, weights_str: str,
+                foreign: float, stocks: float, fx: float, illiquid: float,
+                sharpe: float, service: float,
+                has_baseline: bool, bl_foreign: float, bl_stocks: float,
+                bl_sharpe: float, bl_service: float) -> str:
+    """Call Claude API to generate a Hebrew explanation of this alternative."""
+    import requests as _req
+
+    api_key = ""
+    try:
+        if hasattr(st, "secrets") and "ANTHROPIC_API_KEY" in st.secrets:
+            api_key = str(st.secrets["ANTHROPIC_API_KEY"])
+    except Exception:
+        pass
+    if not api_key:
+        import os
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return ""
+
+    baseline_block = ""
+    if has_baseline:
+        baseline_block = (
+            f"\nהמצב הנוכחי של הלקוח: חו\"ל {bl_foreign:.1f}%, מניות {bl_stocks:.1f}%, "
+            f"שארפ {bl_sharpe:.2f}, שירות {bl_service:.1f}."
+        )
+
+    prompt = (
+        f"אתה יועץ פיננסי ישראלי מנוסה המתמחה בקרנות השתלמות. "
+        f"תפקידך לנסח הסבר תמציתי ומשכנע — 2-3 משפטים בלבד — למה החלופה הזו מתאימה ללקוח."
+        f"\n\nהחלופה: {title}"
+        f"\nמנהלים: {managers}"
+        f"\nחלוקת משקלים: {weights_str}"
+        f"\nחשיפות: חו\"ל {foreign:.1f}%, מניות {stocks:.1f}%, מט\"ח {fx:.1f}%, לא-סחיר {illiquid:.1f}%"
+        f"\nמדד שארפ: {sharpe:.2f} | ציון שירות ואיכות: {service:.1f}"
+        f"{baseline_block}"
+        f"\n\nכתוב בעברית תמציתית. התמקד בערך המוסף העיקרי. אל תציין ש'אתה AI'."
+    )
+
+    try:
+        resp = _req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 180,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=12,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            for blk in data.get("content", []):
+                if blk.get("type") == "text":
+                    return str(blk["text"]).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _mini_alloc_bar_html(items: List[Dict]) -> str:
+    """Generate compact horizontal stacked bar HTML for fund weights."""
+    if not items:
+        return ""
+    colors = BAR_COLORS
+    rows = ""
+    for i, it in enumerate(items[:4]):
+        pct_str = str(it.get("pct", "0")).replace("%", "")
+        try:
+            pct = float(pct_str)
+        except Exception:
+            pct = 0.0
+        color = colors[i % len(colors)]
+        width = max(2, min(100, int(pct)))
+        name  = str(it.get("fund", ""))[:28]
+        rows += (
+            f"<div class='rc-fund-row'>"
+            f"<span class='rc-fund-pct'>{pct_str}%</span>"
+            f"<div class='rc-fund-bar-wrap'><div class='rc-fund-bar' style='width:{width}%;background:{color}'></div></div>"
+            f"<span class='rc-fund-name'>{_esc(name)}</span>"
+            f"</div>"
+        )
+    return f"<div class='rc-funds'>{rows}</div>"
+
+
+def _kpi_chip_html(label: str, val: float, baseline_val: Optional[float] = None,
+                   is_lower_better: bool = False, fmt: str = "{:.1f}%") -> str:
+    val_str = fmt.format(val)
+    delta_html = ""
+    if baseline_val is not None:
+        diff = val - baseline_val
+        if abs(diff) < 0.1:
+            cls = "flat"; arrow = "→"
+        elif (diff > 0 and not is_lower_better) or (diff < 0 and is_lower_better):
+            cls = "up";   arrow = "▲"
+        else:
+            cls = "down"; arrow = "▼"
+        diff_str = ("+" if diff >= 0 else "") + fmt.format(diff)
+        delta_html = f"<span class='rc-kpi-delta {cls}'>{arrow}{diff_str}</span>"
+    return (
+        f"<div class='rc-kpi'>"
+        f"<span class='rc-kpi-label'>{_esc(label)}</span>"
+        f"<span class='rc-kpi-val'>{_esc(val_str)}</span>"
+        f"{delta_html}"
+        f"</div>"
+    )
+
+
+def _delta_grid_html(row: Dict, baseline: Dict) -> str:
+    """Inline 3-col delta grid comparing baseline vs proposed."""
+    items = [
+        ('חו"ל',     float(baseline.get("foreign",0)),  float(row.get('חו"ל (%)',0)),   False, "{:.1f}%"),
+        ("מניות",    float(baseline.get("stocks",0)),   float(row.get("מניות (%)",0)),  False, "{:.1f}%"),
+        ('מט"ח',     float(baseline.get("fx",0)),       float(row.get('מט"ח (%)',0)),   False, "{:.1f}%"),
+        ("לא-סחיר",  float(baseline.get("illiquid",0)), float(row.get("לא־סחיר (%)",0)), True, "{:.1f}%"),
+        ("שארפ",     float(baseline.get("sharpe",0)),   float(row.get("שארפ משוקלל",0)), False, "{:.2f}"),
+        ("שירות ואיכות",    float(baseline.get("service",0)),  float(row.get("שירות משוקלל",0)), False, "{:.0f}"),
+    ]
+    cells = ""
+    for label, cur, new, lower_better, fmt in items:
+        diff = new - cur
+        if abs(diff) < 0.05:
+            arrow_cls = "flat"; arrow = "→"
+        elif (diff > 0 and not lower_better) or (diff < 0 and lower_better):
+            arrow_cls = "up"; arrow = "▲"
+        else:
+            arrow_cls = "down"; arrow = "▼"
+        cells += (
+            f"<div class='rc-delta-item'>"
+            f"<span class='rc-delta-item-label'>{_esc(label)}</span>"
+            f"<div class='rc-delta-item-vals'>"
+            f"<span class='rc-delta-item-cur'>{fmt.format(cur)}</span>"
+            f"<span class='rc-delta-item-arrow {arrow_cls}'>{arrow}</span>"
+            f"<span class='rc-delta-item-new'>{fmt.format(new)}</span>"
+            f"</div></div>"
+        )
+    return f"<div class='rc-delta'><div class='rc-delta-title'>השוואה למצב קיים</div><div class='rc-delta-grid'>{cells}</div></div>"
+
+
+def _render_compact_card(r: Dict, title: str, card_cls: str = "",
+                         baseline: Optional[Dict] = None,
+                         ai_text: str = "",
+                         card_key: str = ""):
+    """Render a compact Bloomberg-style result card fully in HTML."""
+    items = r.get("weights_items") or _weights_items(r.get("weights"), r.get("קופות",""), r.get("מסלולים",""), r.get("מנהלים_רשימה",""))
+
+    # Change type badge
+    prop_mgrs = [m.strip() for m in str(r.get("מנהלים","")).split("|") if m.strip()]
+    cur_mgrs  = list(st.session_state.get("portfolio_managers", []))
+    change_badge = _change_type_badge(cur_mgrs, prop_mgrs) if baseline else ""
+
+    # Head badge
+    badge_text = {"rc-primary": "⭐ ממולץ", "rc-service": "🤝 שירות"}.get(card_cls, "📊")
+    badge_cls  = {"rc-primary": "rc-badge-blue", "rc-service": "rc-badge-green"}.get(card_cls, "rc-badge-amber")
+
+    mgr_str = str(r.get("מנהלים",""))[:60]
+    sharpe  = _to_float(r.get("שארפ משוקלל"))
+    service = _to_float(r.get("שירות משוקלל"))
+    foreign = _to_float(r.get('חו"ל (%)'))
+    stocks  = _to_float(r.get("מניות (%)"))
+    fx      = _to_float(r.get('מט"ח (%)'))
+    illiquid= _to_float(r.get("לא־סחיר (%)"))
+
+    bl_f  = float(baseline.get("foreign",0))  if baseline else None
+    bl_s  = float(baseline.get("stocks",0))   if baseline else None
+    bl_fx = float(baseline.get("fx",0))       if baseline else None
+    bl_il = float(baseline.get("illiquid",0)) if baseline else None
+    bl_sh = float(baseline.get("sharpe",0))   if baseline else None
+    bl_sv = float(baseline.get("service",0))  if baseline else None
+
+    kpis_html = (
+        _kpi_chip_html('חו"ל',     foreign,  bl_f,  False) +
+        _kpi_chip_html("מניות",    stocks,   bl_s,  False) +
+        _kpi_chip_html('מט"ח',     fx,       bl_fx, False) +
+        _kpi_chip_html("לא-סחיר",  illiquid, bl_il, True)  +
+        _kpi_chip_html("שארפ",     sharpe,   bl_sh, False, "{:.2f}")  +
+        _kpi_chip_html("שירות ואיכות",    service,  bl_sv, False, "{:.0f}")
+    )
+
+    delta_section = _delta_grid_html(r, baseline) if baseline else ""
+
+    ai_section = ""
+    if ai_text:
+        ai_section = f"<div class='rc-ai'><div class='rc-ai-label'>🤖 ניתוח AI</div><div class='rc-ai-text'>{_esc(ai_text)}</div></div>"
+    elif ai_text == "":
+        # placeholder while loading
+        ai_section = "<div class='rc-ai'><div class='rc-ai-spinner'>טוען ניתוח AI...</div></div>"
+
+    alloc_html = _mini_alloc_bar_html(items)
+
+    st.markdown(f"""
+    <div class='rc {card_cls}'>
+      <div class='rc-head'>
+        <span class='rc-title'>{_esc(title)}</span>
+        <div style='display:flex;gap:6px;align-items:center;flex-wrap:wrap'>
+          {change_badge}
+          <span class='rc-badge {badge_cls}'>{badge_text}</span>
+        </div>
+      </div>
+      <div style='padding:4px 14px 2px;font-size:11px;color:#64748b'>{_esc(mgr_str)}</div>
+      {alloc_html}
+      <div class='rc-kpis'>{kpis_html}</div>
+      {delta_section}
+      {ai_section}
+    </div>
+    """, unsafe_allow_html=True)
+
+# Keep old helpers for comparison tab
+def _alloc_plot(r):
+    labels = ["מניות", 'חו"ל', 'מט"ח', "לא־סחיר"]
+    vals = []
+    for k in ["מניות (%)", 'חו"ל (%)', 'מט"ח (%)', "לא־סחיר (%)"]:
+        try: vals.append(float(r.get(k) or 0))
+        except: vals.append(0.0)
+    text_labels = [f"{lbl} · {v:.1f}%" for lbl, v in zip(labels, vals)]
+    fig = go.Figure(go.Bar(x=vals, y=labels, orientation='h', text=text_labels, textposition='outside',
+        cliponaxis=False, marker=dict(color=['#6366f1','#8b5cf6','#a78bfa','#c4b5fd'])))
+    fig.update_layout(height=200, margin=dict(l=10,r=120,t=0,b=0),
+        xaxis=dict(range=[0,100], showgrid=False, zeroline=False, visible=False),
+        yaxis=dict(autorange='reversed', tickfont=dict(size=12), showgrid=False, title=None),
+        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', showlegend=False)
+    return fig
+
+def _manager_donut(mgr_break):
+    labels=[m for m,_ in mgr_break] or ["ללא"]
+    values=[float(p) for _,p in mgr_break] or [100.0]
+    fig = go.Figure(go.Pie(labels=labels, values=values, hole=0.62, textinfo='percent', sort=False))
+    fig.update_traces(marker=dict(colors=['#4f46e5','#7c3aed','#06b6d4','#22c55e','#f59e0b','#ef4444']))
+    fig.update_layout(height=180, margin=dict(l=0,r=0,t=0,b=0), showlegend=False, paper_bgcolor='rgba(0,0,0,0)')
+    return fig
+
+
+def _radar_chart(top_df, targets):
+    categories = ['חו"ל', "מניות", 'מט"ח', "לא־סחיר", "שארפ×10", "שירות ואיכות÷10"]
+    fig = go.Figure()
+    colors = ["#2563eb", "#16a34a", "#ea580c", "#7c3aed"]
+    for i, row in top_df.iterrows():
+        vals = [
+            float(row.get('חו"ל (%)', 0) or 0),
+            float(row.get("מניות (%)", 0) or 0),
+            float(row.get('מט"ח (%)', 0) or 0),
+            float(row.get("לא־סחיר (%)", 0) or 0),
+            float(row.get("שארפ משוקלל", 0) or 0) * 10,
+            float(row.get("שירות משוקלל", 0) or 0) / 10,
+        ]
+        fig.add_trace(go.Scatterpolar(
+            r=vals + [vals[0]], theta=categories + [categories[0]],
+            fill="toself", opacity=0.25,
+            line=dict(color=colors[i % len(colors)], width=2),
+            name=str(row.get("חלופה", f"חלופה {i+1}")),
+        ))
+    tgt_vals = [targets.get("foreign",0), targets.get("stocks",0), targets.get("fx",0), targets.get("illiquid",0), 0, 0]
+    fig.add_trace(go.Scatterpolar(
+        r=tgt_vals + [tgt_vals[0]], theta=categories + [categories[0]],
+        mode="lines", line=dict(color="rgba(239,68,68,0.7)", width=1.5, dash="dot"), name="יעד",
+    ))
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(size=9)),
+            angularaxis=dict(direction="clockwise"),
+        ),
+        showlegend=True, height=420,
+        margin=dict(t=30, b=10, l=20, r=20),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=-0.12),
+        font=dict(family="sans-serif", size=11),
+    )
+    return fig
+
+def _export_excel(top3, baseline=None):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        display_cols = [
+            "חלופה", "יתרון", "קופות", "מסלולים", "משקלים",
+            'חו"ל (%)', "מניות (%)", 'מט"ח (%)', "לא־סחיר (%)",
+            "שארפ משוקלל", "שירות משוקלל", "score",
+        ]
+        cols_exist = [c for c in display_cols if c in top3.columns]
+        sheet_df = top3[cols_exist].copy()
+
+        # ── פיצ׳ר 4: הוסף עמודות מצב קיים ──
+        if baseline:
+            for key, col_name in [("foreign",'חו"ל קיים (%)'),("stocks","מניות קיים (%)"),
+                                   ("fx",'מט"ח קיים (%)'),("illiquid","לא-סחיר קיים (%)")]:
+                sheet_df[col_name] = baseline.get(key, "—")
+
+        sheet_df.to_excel(writer, sheet_name="חלופות", index=False)
+
+        for i, row in top3.iterrows():
+            items = row.get("weights_items") or []
+            if items:
+                detail_df = pd.DataFrame(items)
+                # _weights_items returns: pct, fund, track, manager
+                expected = ["אחוז", "קרן", "מסלול", "מנהל"]
+                if len(detail_df.columns) == len(expected):
+                    detail_df.columns = expected
+                elif len(detail_df.columns) == 3:
+                    detail_df.columns = ["אחוז", "קרן", "מסלול"]
+                sheet_name = f"חלופה {i+1}"[:31]
+                detail_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    return output.getvalue()
+
+
+# ─────────────────────────────────────────────
+# Load data (product-type aware)
+# ─────────────────────────────────────────────
+_product_type_now = st.session_state.get("product_type", "קרנות השתלמות")
+_active_sheet_id  = (
+    POLICIES_GSHEET_ID if _product_type_now == "פוליסות חיסכון"
+    else PENSION_GSHEET_ID if _product_type_now == "קרנות פנסיה"
+    else GEMEL_GSHEET_ID   if _product_type_now == "קופות גמל"
+    else GEMEL_INV_GSHEET_ID if _product_type_now == "גמל להשקעה"
+    else FUNDS_GSHEET_ID
+)
+
+with st.spinner("🔄 טוען נתונים מ-Google Sheets..."):
+    df_long, service_map, load_warnings = load_funds_long(
+        _active_sheet_id, SERVICE_GSHEET_ID, _product_type_now
+    )
+    if load_warnings:
+        with st.expander('אזהרות טעינת נתונים', expanded=False):
+            for w in load_warnings:
+                st.warning(w)
+
+if load_warnings:
+    for w in load_warnings:
+        st.warning(f"⚠️ {w}")
+
+if df_long.empty:
+    err_details = " | ".join(load_warnings) if load_warnings else "סיבה לא ידועה"
+    st.error(
+        f"❌ לא הצלחתי לטעון נתונים מ-Google Sheets.\n\n"
+        f"**פרטי השגיאה:** {err_details}\n\n"
+        "ודא שהגיליונות פתוחים לשיתוף ('Anyone with the link') ושמבנה הגיליון תקין."
+    )
+    st.stop()
+
+n_tracks  = df_long["track"].nunique()
+n_records = len(df_long)
+all_funds = sorted(df_long["fund"].unique().tolist())
+
+
+# ─────────────────────────────────────────────
+# Session state defaults
+# ─────────────────────────────────────────────
+def _init_state():
+    st.session_state.setdefault("n_funds",           2)
+    st.session_state.setdefault("mix_policy",        "מותר לערבב מנהלים")
+    st.session_state.setdefault("step",              5)
+    st.session_state.setdefault("primary_rank",      "דיוק")
+    st.session_state.setdefault("locked_fund",       "")
+    st.session_state.setdefault("locked_amount",     0.0)   # פיצ׳ר 3
+    st.session_state.setdefault("total_amount",      0.0)   # פיצ׳ר 3
+    st.session_state.setdefault("selected_managers", None)
+    st.session_state.setdefault("targets",      {"foreign": 30.0, "stocks": 40.0, "fx": 25.0, "illiquid": 20.0})
+    st.session_state.setdefault("include",      {"foreign": True, "stocks": True, "fx": True, "illiquid": True})
+    st.session_state.setdefault("constraint",   {
+        "foreign":  ("רך", "בדיוק"),
+        "stocks":   ("רך", "בדיוק"),
+        "fx":       ("רך", "בדיוק"),
+        "illiquid": ("רך", "בדיוק"),
+    })
+    st.session_state.setdefault("last_results",      None)
+    st.session_state.setdefault("last_note",         "")
+    st.session_state.setdefault("run_history",       [])
+    # פיצ׳ר 1
+    st.session_state.setdefault("portfolio_holdings",  None)
+    st.session_state.setdefault("portfolio_baseline",  None)
+    st.session_state.setdefault("portfolio_total",     0.0)
+    st.session_state.setdefault("portfolio_managers",  [])
+    # פיצ׳ר 2
+    st.session_state.setdefault("quick_profile_active", None)
+    st.session_state.setdefault("selected_alt", None)
+    st.session_state.setdefault("voted_this_session", None)
+    st.session_state.setdefault("show_vote_stats", False)
+    # product type switcher
+    st.session_state.setdefault("product_type", "קרנות השתלמות")
+    # internal flags (ephemeral – popped when used)
+    st.session_state.setdefault("_qf_scroll_to_cmp", False)
+    st.session_state.setdefault("_mgr_clear_flag", False)
+
+_init_state()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# UI  – Single-page Premium Fintech Layout (v3.6)
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Dynamic terminology helper ───────────────────────────────────────
+def _lbl(key: str) -> str:
+    """Return UI label based on active product type."""
+    is_policy = st.session_state.get("product_type") == "פוליסות חיסכון"
+    is_pension = st.session_state.get("product_type") == "קרנות פנסיה"
+    is_gemel     = st.session_state.get("product_type") == "קופות גמל"
+    is_gemel_inv = st.session_state.get("product_type") == "גמל להשקעה"
+    _labels = {
+        "product_plural":   "פוליסות חיסכון" if is_policy else "קרנות פנסיה" if is_pension else "קופות גמל" if is_gemel else "גמל להשקעה" if is_gemel_inv else "קרנות",
+        "product_singular": "פוליסת חיסכון"  if is_policy else "קרן פנסיה"   if is_pension else "קופת גמל"  if is_gemel else "גמל להשקעה" if is_gemel_inv else "קרן",
+        "fund_count_lbl":   "פוליסות"         if is_policy else "קרנות"        if is_pension else "קופות"     if is_gemel or is_gemel_inv else "קופות",
+        "manager_lbl":      "מנהל ההשקעות"    if is_policy else "מנהל",
+        "n_funds_lbl":      "מספר פוליסות לשלב" if is_policy else "מספר קרנות לשלב",
+        "subtitle":         "אופטימיזציה לתמהיל פוליסות חיסכון" if is_policy
+                            else "אופטימיזציה לתמהיל מסלולי קרנות פנסיה" if is_pension
+                            else "אופטימיזציה לתמהיל קופות גמל" if is_gemel
+                            else "אופטימיזציה לתמהיל גמל להשקעה" if is_gemel_inv
+                            else "אופטימיזציה לתמהיל מסלולי קרנות השתלמות",
+    }
+    return _labels.get(key, key)
+
+
+# ── RENDER PRODUCT SELECTOR ─────────────────────────────────────────
+def render_product_selector():
+    pt = st.session_state.get("product_type", "קרנות השתלמות")
+    st.markdown("""
+<div style='display:flex;gap:0;border:1.5px solid #D1D5DB;border-radius:10px;
+overflow:hidden;width:fit-content;margin-bottom:8px'>
+""", unsafe_allow_html=True)
+    c1, c2, c3, c4, c5, _ = st.columns([1.3, 1.5, 1.3, 1.3, 1.5, 1])
+    with c1:
+        if st.button("🏦 קרנות השתלמות",
+                     type="primary" if pt == "קרנות השתלמות" else "secondary",
+                     use_container_width=True, key="pt_funds"):
+            if pt != "קרנות השתלמות":
+                for k in ["last_results","selected_alt","run_history","quick_profile_active"]:
+                    st.session_state[k] = [] if k == "run_history" else None
+                st.session_state["product_type"] = "קרנות השתלמות"
+                st.rerun()
+    with c2:
+        if st.button("📋 פוליסות חיסכון",
+                     type="primary" if pt == "פוליסות חיסכון" else "secondary",
+                     use_container_width=True, key="pt_policies"):
+            if pt != "פוליסות חיסכון":
+                for k in ["last_results","selected_alt","run_history","quick_profile_active"]:
+                    st.session_state[k] = [] if k == "run_history" else None
+                st.session_state["product_type"] = "פוליסות חיסכון"
+                st.rerun()
+    with c3:
+        if st.button("🏛️ קרנות פנסיה",
+                     type="primary" if pt == "קרנות פנסיה" else "secondary",
+                     use_container_width=True, key="pt_pension"):
+            if pt != "קרנות פנסיה":
+                for k in ["last_results","selected_alt","run_history","quick_profile_active"]:
+                    st.session_state[k] = [] if k == "run_history" else None
+                st.session_state["product_type"] = "קרנות פנסיה"
+                st.rerun()
+    with c4:
+        if st.button("💼 קופות גמל",
+                     type="primary" if pt == "קופות גמל" else "secondary",
+                     use_container_width=True, key="pt_gemel"):
+            if pt != "קופות גמל":
+                for k in ["last_results","selected_alt","run_history","quick_profile_active"]:
+                    st.session_state[k] = [] if k == "run_history" else None
+                st.session_state["product_type"] = "קופות גמל"
+                st.rerun()
+    with c5:
+        if st.button("📈 גמל להשקעה",
+                     type="primary" if pt == "גמל להשקעה" else "secondary",
+                     use_container_width=True, key="pt_gemel_inv"):
+            if pt != "גמל להשקעה":
+                for k in ["last_results","selected_alt","run_history","quick_profile_active"]:
+                    st.session_state[k] = [] if k == "run_history" else None
+                st.session_state["product_type"] = "גמל להשקעה"
+                st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ── helpers shared across renders ──────────────────────────────────
+def _pct(v, dec=1):
+    try: return f"{float(v):.{dec}f}%"
+    except: return "—"
+
+def _num(v, dec=2):
+    try: return f"{float(v):.{dec}f}"
+    except: return "—"
+
+def _chip(label, val, fmt="{:.1f}%", lower_better=False, baseline_val=None, dark=False):
+    val_s = fmt.format(float(val)) if val not in (None, "—") else "—"
+    arrow = ""
+    if baseline_val is not None:
+        try:
+            d = float(val) - float(baseline_val)
+            if abs(d) < 0.05: arrow = ""
+            elif (d > 0 and not lower_better) or (d < 0 and lower_better):
+                arrow = f" <span style='color:#34d399;font-size:9px'>▲</span>" if dark else f" <span style='color:#15A46E;font-size:9px'>▲</span>"
+            else:
+                arrow = f" <span style='color:#f87171;font-size:9px'>▼</span>" if dark else f" <span style='color:#DC2626;font-size:9px'>▼</span>"
+        except: pass
+    if dark:
+        return f"<div style='padding:4px 11px;border-radius:999px;font-size:12px;font-weight:700;background:#2a4a70;color:#bfdbfe;border:1px solid #3a5f8a'>{_esc(label)} {_esc(val_s)}{arrow}</div>"
+    return f"<div class='br-chip'>{_esc(label)} {_esc(val_s)}{arrow}</div>"
+
+
+# ── RENDER HEADER ───────────────────────────────────────────────────
+def render_header(n_records, n_managers, n_alts):
+    alts_display = str(n_alts) if n_alts else "—"
+    subtitle  = _lbl("subtitle")
+    cnt_label = _lbl("fund_count_lbl")
+    st.markdown(f"""
+<div class="pmo-header">
+  <div class="pmo-header-left">
+    <div class="pmo-logo-box">📊</div>
+    <div>
+      <div class="pmo-title">Profit Mix Optimizer</div>
+      <div class="pmo-sub">{_esc(subtitle)}</div>
+    </div>
+  </div>
+  <div class="pmo-kpis">
+    <div class="pmo-kpi"><span class="pmo-kpi-val">{n_records:,}</span><span class="pmo-kpi-lbl">{cnt_label}</span></div>
+    <div class="pmo-kpi"><span class="pmo-kpi-val">{n_managers}</span><span class="pmo-kpi-lbl">מנהלים</span></div>
+    <div class="pmo-kpi"><span class="pmo-kpi-val">{alts_display}</span><span class="pmo-kpi-lbl">חלופות</span></div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ── RENDER QUICK FILTERS ────────────────────────────────────────────
+QUICK_PROFILES_NEW = {
+    "📈 מניות":  {"stocks_min": 90},
+    '🏦 אג"ח':   {"stocks_max": 10, "illiquid_max": 10},
+    "🌍 חו״ל":   {"foreign_min": 95},
+    "🇮🇱 ישראל": {"foreign_max": 10},
+    '💱 מט"ח':   {"fx_min": 90},
+    "🔵 כללי":   {"track_exact_word": "כללי"},  # רק מסלולים ששמם מכיל "כללי"
+}
+
+# Manager patterns unchecked by default (substring, case-insensitive for Latin).
+# Used both for checkbox defaults in the UI and for the optimizer candidate dataset.
+_DEFAULT_UNCHECKED_PATTERNS = ["מנורה", "idi", "אי.די.אי", "אינפיניטי"]
+
+def _is_default_unchecked(mgr_name: str) -> bool:
+    """Return True if mgr_name contains any blocked pattern (substring match)."""
+    low = mgr_name.strip().lower()
+    return any(pat in low for pat in _DEFAULT_UNCHECKED_PATTERNS)
+
+def render_quick_filters(df_active):
+    st.markdown("""
+<div style='display:flex;align-items:center;gap:10px;margin-bottom:10px'>
+  <span style='font-size:16px;font-weight:700;color:#1F3A5F'>סינון לפי מסלול טהור</span>
+  <span style='background:#EFF6FF;border:1px solid #BFDBFE;border-radius:6px;padding:3px 9px;font-size:11px;cursor:default;color:#1e40af'
+        title='מסלול טהור = קרן שהשקעתה ממוקדת בנכס בודד (כגון: מניות 90%+, אג&quot;ח 90%+ וכד&apos;). מנוגד למסלול כללי שמאזן בין כמה נכסים.'>
+    💡 מה זה מסלול טהור?
+  </span>
+</div>""", unsafe_allow_html=True)
+    st.markdown("<div class='nav-bar'>", unsafe_allow_html=True)
+    current_qp = st.session_state.get("quick_profile_active")
+    options = ["↺ איפוס"] + list(QUICK_PROFILES_NEW.keys())
+    default_idx = 0
+    if current_qp in QUICK_PROFILES_NEW:
+        default_idx = list(QUICK_PROFILES_NEW.keys()).index(current_qp) + 1
+    sel = st.radio(
+        "מסלול מהיר", options=options, horizontal=True,
+        index=default_idx, label_visibility="collapsed", key="qf_radio"
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if sel == "↺ איפוס":
+        if st.session_state.get("quick_profile_active"):
+            st.session_state["quick_profile_active"] = None
+            st.rerun()
+    else:
+        new_qp = sel
+        if new_qp != st.session_state.get("quick_profile_active"):
+            st.session_state["quick_profile_active"] = new_qp
+            st.session_state["_qf_scroll_to_cmp"] = True  # trigger scroll + open
+            # auto-fill targets from profile
+            pf = QUICK_PROFILES_NEW[new_qp]
+            if "stocks_min"  in pf: st.session_state["targets"]["stocks"]  = float(pf["stocks_min"])
+            if "foreign_min" in pf: st.session_state["targets"]["foreign"] = float(pf["foreign_min"])
+            if "fx_min"      in pf: st.session_state["targets"]["fx"]      = float(pf["fx_min"])
+            st.rerun()
+
+
+# ── RENDER MIX BUILDER (left card) ─────────────────────────────────
+def render_mix_builder(df_active, all_funds_list):
+
+    params = [
+        ("stocks",   "📈 מניות",   True),
+        ("foreign",  '🌍 חו"ל',    True),
+        ("fx",       '💱 מט"ח',    True),
+        ("illiquid", "🔒 לא-סחיר", False),
+    ]
+
+    # ── Advanced settings expander (above the card) ──
+    with st.expander("⚙️ הגדרות מתקדמות והצגת מצב קיים", expanded=False):
+
+        # ══ 1. נעילת קרנות — ראשון בסדר ══════════════════════════════════
+        st.markdown("#### 🔒 נעילת קרנות מצב קיים")
+        st.caption("בחר קרנות שכבר קיימות אצל הלקוח — מכל מוצר שצריך. המערכת תחשב השלמה.")
+
+        locked_funds_state = st.session_state.setdefault("locked_funds_multi", {})
+        locked_amounts_state = st.session_state.setdefault("locked_amounts_map", {})
+
+        all_products_funds = {
+            "קרנות השתלמות": FUNDS_GSHEET_ID,
+            "פוליסות חיסכון": POLICIES_GSHEET_ID,
+            "קרנות פנסיה":    PENSION_GSHEET_ID,
+            "קופות גמל":      GEMEL_GSHEET_ID,
+            "גמל להשקעה":     GEMEL_INV_GSHEET_ID,
+        }
+
+        for prod_name in all_products_funds:
+            # get fund list for this product from df_long if it's the active product, else skip
+            if prod_name == st.session_state.get("product_type", "קרנות השתלמות"):
+                fund_list_for_prod = sorted(df_long["fund"].unique().tolist())
+            else:
+                # Use cached df for other products (lightweight — already cached)
+                _pid = all_products_funds[prod_name]
+                _df_other, _, _ = load_funds_long(_pid, SERVICE_GSHEET_ID, prod_name)
+                fund_list_for_prod = sorted(_df_other["fund"].unique().tolist()) if not _df_other.empty else []
+
+            if not fund_list_for_prod:
+                continue
+
+            cur_sel = [f for f in locked_funds_state.get(prod_name, []) if f in fund_list_for_prod]
+            new_sel = st.multiselect(
+                prod_name,
+                options=fund_list_for_prod,
+                default=cur_sel,
+                key=f"lock_multi_{prod_name}",
+                placeholder="הקלד שם קרן לחיפוש..."
+            )
+            locked_funds_state[prod_name] = new_sel
+
+        st.session_state["locked_funds_multi"] = locked_funds_state
+
+        all_locked_pairs = [
+            (prod, fund)
+            for prod, funds in locked_funds_state.items()
+            for fund in funds
+        ]
+
+        total_locked_sum = 0.0
+        if all_locked_pairs:
+            st.markdown("**סכום לכל קרן נעולה (₪):**")
+            for prod, fund in all_locked_pairs:
+                key_id = f"{prod}::{fund}"
+                cur_amt = float(locked_amounts_state.get(key_id, 0.0))
+                amt = st.number_input(
+                    f"{fund}  |  {prod}",
+                    min_value=0.0, value=cur_amt, step=10000.0, format="%.0f",
+                    key=f"lock_amt_{key_id}"
+                )
+                locked_amounts_state[key_id] = amt
+                total_locked_sum += amt
+            st.session_state["locked_amounts_map"] = locked_amounts_state
+
+        # סכום לחלוקה + סה"כ
+        st.markdown("---")
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            distrib_amt = st.number_input(
+                "💰 סכום לחלוקה לקרנות נוספות (₪)",
+                min_value=0.0,
+                value=float(st.session_state.get("distrib_amount", 0.0)),
+                step=10000.0, format="%.0f", key="adv_distrib_amt"
+            )
+            st.session_state["distrib_amount"] = distrib_amt
+        with col_d2:
+            grand_total = total_locked_sum + distrib_amt
+            if grand_total > 0:
+                st.markdown(f"""
+<div style='background:#F0F4FF;border:1px solid #C7D7FF;border-radius:8px;
+padding:10px 14px;margin-top:4px;text-align:center'>
+  <div style='font-size:11px;color:#6B7280'>סה"כ תיק</div>
+  <div style='font-size:20px;font-weight:800;color:#1F3A5F'>₪{grand_total:,.0f}</div>
+  <div style='font-size:10px;color:#9CA3AF'>
+    נעול: ₪{total_locked_sum:,.0f} &nbsp;|&nbsp; לחלוקה: ₪{distrib_amt:,.0f}
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        # backwards-compat לאופטימייזר הקיים
+        active_prod = st.session_state.get("product_type", "קרנות השתלמות")
+        active_locked_funds = [f for p, f in all_locked_pairs if p == active_prod]
+        if active_locked_funds:
+            first_fund = active_locked_funds[0]
+            first_key  = f"{active_prod}::{first_fund}"
+            st.session_state["locked_fund"]   = first_fund
+            st.session_state["locked_amount"] = float(locked_amounts_state.get(first_key, 0.0))
+            st.session_state["total_amount"]  = grand_total if grand_total > 0 else distrib_amt
+        else:
+            st.session_state["locked_fund"]   = ""
+            st.session_state["locked_amount"] = 0.0
+            st.session_state["total_amount"]  = distrib_amt
+
+        st.markdown("---")
+
+        # ══ 2. מספר קרנות + מדיניות ══════════════════════════════════════
+        ca, cb = st.columns(2)
+        with ca:
+            extra_label = "בנוסף לקרנות הנעולות" if all_locked_pairs else _lbl("n_funds_lbl")
+            st.session_state["n_funds"] = st.selectbox(
+                extra_label, options=[1, 2, 3],
+                index=[1,2,3].index(st.session_state["n_funds"]),
+                key="adv_nfunds"
+            )
+        with cb:
+            st.session_state["mix_policy"] = st.selectbox(
+                "מדיניות מנהלים",
+                options=["מותר לערבב מנהלים", "אותו מנהל בלבד"],
+                index=0 if st.session_state["mix_policy"] == "מותר לערבב מנהלים" else 1,
+                key="adv_policy"
+            )
+
+        with st.expander("🎯 מגבלות יעד (קשיח/רך)", expanded=False):
+            st.caption("ברירת מחדל: כל המגבלות רכות (משפיעות רק על הדירוג)")
+            for key, label, _ in params:
+                constraint = st.session_state["constraint"]
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    h = st.selectbox(f"{label} – קשיחות", ["רך", "קשיח"],
+                        index=0 if constraint.get(key, ("רך",))[0] == "רך" else 1,
+                        key=f"hard_{key}")
+                with cc2:
+                    m = st.selectbox(f"{label} – כיוון", ["בדיוק", "לפחות", "לכל היותר"],
+                        index=["בדיוק","לפחות","לכל היותר"].index(constraint.get(key, ("רך","בדיוק"))[1]),
+                        key=f"mode_{key}")
+                constraint[key] = (h, m)
+            st.session_state["constraint"] = constraint
+
+        # Manager filter – uses df_long so deselected managers remain visible
+        all_mgrs_full = sorted(df_long["manager"].unique().tolist())
+        # _is_default_unchecked / _DEFAULT_UNCHECKED_PATTERNS defined at module level
+        _mgr_state = st.session_state.get("selected_managers")
+        if _mgr_state is None:
+            # First load — exclude managers matching any blocked pattern
+            real_sel_mgrs = [m for m in all_mgrs_full if not _is_default_unchecked(m)]
+        else:
+            real_sel_mgrs = _mgr_state
+        sel_mgrs = [m for m in real_sel_mgrs if m in all_mgrs_full and m != "__none__"]
+        if not sel_mgrs and "__none__" not in (real_sel_mgrs or []):
+            sel_mgrs = all_mgrs_full
+
+        st.markdown("**🏢 סינון מנהלים**")
+        mb1, mb2, _ = st.columns([1,1,3])
+        with mb1:
+            if st.button("בחר הכל", key="mgr_all2", use_container_width=True):
+                st.session_state["selected_managers"] = all_mgrs_full.copy()
+                st.rerun()
+        with mb2:
+            if st.button("נקה הכל", key="mgr_none2", use_container_width=True):
+                st.session_state["selected_managers"] = ["__none__"]
+                st.session_state["_mgr_clear_flag"] = True
+                st.rerun()
+
+        cleared = st.session_state.pop("_mgr_clear_flag", False)
+        mgr_cols = st.columns(3)
+        new_sel = []
+        for i, mgr in enumerate(all_mgrs_full):
+            with mgr_cols[i % 3]:
+                fc = df_long[df_long["manager"] == mgr]["fund"].nunique()
+                is_checked = (not cleared) and (mgr in sel_mgrs)
+                if st.checkbox(f"{mgr} ({fc})", value=is_checked, key=f"mgr_cb2_{mgr}"):
+                    new_sel.append(mgr)
+        new_sel_set = set(new_sel)
+        old_sel_set = set(m for m in sel_mgrs if m != "__none__")
+        if new_sel_set != old_sel_set:
+            st.session_state["selected_managers"] = new_sel if new_sel else ["__none__"]
+            st.rerun()
+
+        # Portfolio import UI removed — helper functions retained in file
+
+    # ── תמהיל card ──
+    st.markdown("<div class='card'>\n<div class='card-title' style='font-size:16px'>⚙️ בניית תמהיל מסלולים אישי</div>", unsafe_allow_html=True)
+
+    tgts = st.session_state["targets"]
+    inc  = st.session_state["include"]
+
+    # חישוב מצב קיים משוקלל מהקרנות הנעולות
+    locked_amounts_state = st.session_state.get("locked_amounts_map", {})
+    locked_funds_state   = st.session_state.get("locked_funds_multi", {})
+    all_locked_pairs_slider = [
+        (prod, fund)
+        for prod, funds in locked_funds_state.items()
+        for fund in funds
+    ]
+
+    def _weighted_locked_param(param_key):
+        """מחשב ממוצע משוקלל של פרמטר מכל הקרנות הנעולות"""
+        total_w, total_v = 0.0, 0.0
+        for prod, fund in all_locked_pairs_slider:
+            key_id = f"{prod}::{fund}"
+            amt = float(locked_amounts_state.get(key_id, 0.0))
+            if amt <= 0:
+                continue
+            match = df_long[df_long["fund"].str.strip() == fund.strip()]
+            if match.empty:
+                continue
+            val = _to_float(match.iloc[0].get(param_key, None))
+            if val is None or (isinstance(val, float) and math.isnan(val)):
+                continue
+            total_w += amt
+            total_v += amt * val
+        return (total_v / total_w) if total_w > 0 else None
+
+    param_key_map = {"stocks": "stocks", "foreign": "foreign", "fx": "fx", "illiquid": "illiquid"}
+
+    for key, label, default_on in params:
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            inc[key] = True
+            val = st.slider(
+                label, 0.0, 100.0,
+                float(tgts.get(key, 0.0)),
+                step=1.0, key=f"sl_{key}", label_visibility="visible"
+            )
+            tgts[key] = val
+            # מצב קיים מתחת ל-slider
+            if all_locked_pairs_slider:
+                cur_val = _weighted_locked_param(param_key_map.get(key, key))
+                if cur_val is not None:
+                    diff = val - cur_val
+                    diff_color = "#15A46E" if diff >= 0 else "#DC2626"
+                    diff_sign  = "+" if diff >= 0 else ""
+                    st.markdown(
+                        f"<div style='font-size:11px;color:#6B7280;margin-top:-8px;margin-bottom:4px'>"
+                        f"מצב קיים: <b>{cur_val:.1f}%</b> "
+                        f"<span style='color:{diff_color}'>{diff_sign}{diff:.1f}%</span></div>",
+                        unsafe_allow_html=True
+                    )
+        with c2:
+            st.markdown(f"<div style='padding-top:28px;font-size:14px;font-weight:800;color:#1F3A5F;text-align:center'>{val:.0f}%</div>", unsafe_allow_html=True)
+
+    st.session_state["targets"] = tgts
+    st.session_state["include"] = inc
+
+    st.markdown("</div>", unsafe_allow_html=True)  # close card
+
+    # ── Calc button ──
+    run = st.button("🔍 חשב חלופות מיטביות", type="primary", use_container_width=True, key="btn_calc")
+
+    return run
+
+
+# ── RENDER BEST SOLUTION (right card) ──────────────────────────────
+def render_best_solution(recs, baseline):
+    if not recs:
+        st.markdown("""
+<div class='card' style='text-align:center;padding:30px 18px'>
+  <div style='font-size:28px;margin-bottom:8px'>⚡</div>
+  <div style='font-size:13px;color:#6B7280'>הגדר יעדים ולחץ <b>חשב חלופות</b></div>
+</div>""", unsafe_allow_html=True)
+        return
+
+    best = recs.get("weighted") or recs.get("accurate", {})
+    if not best:
+        return
+
+    items = best.get("weights_items") or _weights_items(
+        best.get("weights"), best.get("קופות",""), best.get("מסלולים",""), best.get("מנהלים_רשימה",""))
+
+    score    = best.get("score", 0.0)
+    score_pct = max(0.0, 100.0 - float(score) * 100.0)
+    managers = str(best.get("מנהלים",""))[:70]
+    tracks   = " | ".join(str(it.get("track",""))[:20] for it in items)[:80]
+    foreign  = best.get('חו"ל (%)', 0.0)
+    stocks   = best.get("מניות (%)", 0.0)
+    fx       = best.get('מט"ח (%)', 0.0)
+    illiquid = best.get("לא־סחיר (%)", 0.0)
+    sharpe   = best.get("שארפ משוקלל", 0.0)
+    service  = best.get("שירות משוקלל", 0.0)
+
+    bl = baseline or {}
+    chips_html = (
+        _chip("מניות",   stocks,   "{:.1f}%", False, bl.get("stocks"),   dark=True) +
+        _chip('חו"ל',    foreign,  "{:.1f}%", False, bl.get("foreign"),  dark=True) +
+        _chip('מט"ח',    fx,       "{:.1f}%", False, bl.get("fx"),       dark=True) +
+        _chip("לא-סחיר", illiquid, "{:.1f}%", True,  bl.get("illiquid"), dark=True) +
+        _chip("שארפ",    sharpe,   "{:.2f}",  False, bl.get("sharpe"),   dark=True) +
+        _chip("שירות ואיכות", service, "{:.0f}", False, bl.get("service"), dark=True)
+    )
+
+    weights_disp = " | ".join(
+        f"{it.get('pct','')} {str(it.get('fund',''))[:18]}" for it in items
+    )
+
+    sharpe_inc = best.get("sharpe_incomplete", False)
+    sharpe_note = ""
+    if sharpe_inc or (isinstance(sharpe, float) and math.isnan(sharpe)):
+        sharpe_note = "<div style='font-size:10px;color:#92400e;margin-top:2px'>⚠️ לא כל המסלולים פרסמו שארפ</div>"
+
+    # Build per-fund lines (no truncation)
+    fund_lines_html = ""
+    for it in items:
+        pct     = it.get("pct","")
+        fund    = str(it.get("fund",""))
+        track   = str(it.get("track",""))
+        manager = str(it.get("manager",""))
+        label   = track if track else fund
+        mgr_bit = f" <span style='color:#93b4e0;font-size:11px'>({manager})</span>" if manager else ""
+        fund_lines_html += (
+            f"<div style='margin:3px 0;font-size:13px;color:#e2eeff'>"
+            f"<b style='color:#7dd3fc;font-size:14px'>{_esc(pct)}</b> "
+            f"{_esc(label)}{mgr_bit}</div>"
+        )
+
+    st.markdown(f"""
+<div class='card' style='background:#1F3A5F;border-color:#2a4a70'>
+  <div class='card-title' style='color:#fff;font-size:15px'>🏆 החלופה הטובה ביותר</div>
+  <div style='display:flex;align-items:flex-start;gap:16px;margin-bottom:10px'>
+    <div style='text-align:center;min-width:70px'>
+      <div style='font-size:52px;font-weight:900;color:#7dd3fc;line-height:1'>{score_pct:.0f}</div>
+      <div style='font-size:11px;color:#93b4e0;margin-top:2px'>ציון התאמה</div>
+    </div>
+    <div style='flex:1'>{fund_lines_html}</div>
+  </div>
+  {sharpe_note}
+  <div style='display:flex;gap:6px;flex-wrap:wrap;margin-top:8px'>{chips_html}</div>
+</div>
+""", unsafe_allow_html=True)
+
+    # ── Weighted returns table — directly under the blue card ──
+    _wr = _compute_weighted_returns_for_items(items, df_active)
+    def _fret(v):
+        try:
+            f = float(v)
+            return f"{f:.2f}%" if not math.isnan(f) else "אין נתון"
+        except Exception:
+            return "אין נתון"
+    _ret_rows_html = "".join(
+        f"<tr><td style='padding:5px 10px;font-size:12px;color:#374151'>{_esc(lbl)}</td>"
+        f"<td style='padding:5px 10px;font-size:12px;font-weight:700;color:#1F3A5F;text-align:center'>{_esc(_fret(val))}</td></tr>"
+        for lbl, val in [
+            ("תשואה מתחילת השנה",               _wr["ret_ytd"]),
+            ("תשואה מצטברת 12 חודשים אחרונים",  _wr["ret_12m"]),
+            ("תשואה מצטברת 36 חודשים אחרונים",  _wr["ret_36m"]),
+            ("תשואה מצטברת 60 חודשים אחרונים",  _wr["ret_60m"]),
+        ]
+    )
+    st.markdown(f"""
+<div class='card' style='padding:10px 16px 10px;margin-top:2px'>
+<div style='font-size:12px;font-weight:800;color:#1F3A5F;margin-bottom:4px'>📈 תשואות משוקללות — החלופה הנבחרת</div>
+<table style='width:100%;border-collapse:collapse;border:1px solid #E5EAF2;border-radius:8px;overflow:hidden;direction:rtl'>
+  <thead><tr style='background:#1F3A5F'>
+    <th style='padding:5px 10px;color:#F0F4FF;font-size:11px;text-align:right'>מדד</th>
+    <th style='padding:5px 10px;color:#F0F4FF;font-size:11px;text-align:center'>תשואה משוקללת</th>
+  </tr></thead>
+  <tbody style='background:#fff'>{_ret_rows_html}</tbody>
+</table>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ── RENDER RESULTS STRIP ────────────────────────────────────────────
+def render_results_strip(n_solutions, elapsed_note, qp_name):
+    filter_txt = f"פילטר: {_esc(qp_name)}" if qp_name else "ללא פילטר"
+    st.markdown(f"""
+<div class='res-strip'>
+  <span>🔢 <b>{n_solutions}</b> חלופות נמצאו</span>
+  <span>⏱ {_esc(elapsed_note)}</span>
+  <span>🎯 {filter_txt}</span>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ── RENDER RESULTS TABLE ────────────────────────────────────────────
+def render_results_table(rows, baseline, voting_configured):
+    if not rows:
+        return
+
+    selected_alt = st.session_state.get("selected_alt")
+
+    def fmt_val(d, key, is_pct=True, dec=1):
+        v = d.get(key, "—")
+        if v == "—": return "—"
+        try:
+            f = float(v)
+            return f"{f:.{dec}f}%" if is_pct else f"{f:.{dec}f}"
+        except: return "—"
+
+    def tracks_with_weights_html(rrow):
+        """Build multi-line cell: 40% מסלול כללי — מנהל, per fund"""
+        items = rrow.get("weights_items") or []
+        parts = []
+        for it in items:
+            pct     = str(it.get("pct","")).replace("%","").strip()
+            track   = str(it.get("track","")).strip()
+            fund    = str(it.get("fund","")).strip()
+            manager = str(it.get("manager","")).strip()
+            label   = track if track else fund
+            if label:
+                mgr_html = f" <span style='color:#6B7280;font-size:10px'>— {_esc(manager)}</span>" if manager else ""
+                parts.append(f"<b>{_esc(pct)}%</b>&nbsp;{_esc(label)}{mgr_html}")
+        return "<br>".join(parts) if parts else "—"
+
+    # Build table HTML – manager now inline in tracks cell
+    header_cells = "".join(f"<th>{h}</th>" for h in [
+        "לחץ לבחירה ▼", "מסלולים / מנהל / משקל", "מניות", 'חו"ל', 'מט"ח', "לא-סחיר", "שארפ", "שירות ואיכות", "תשואה 12 חו׳ אחרונים"
+    ])
+
+    # ── Target row: shows user's requested mix at top of table ──
+    target_map = st.session_state.get("targets", {}) or {}
+    def _tpct(k): return f"{float(target_map.get(k, 0) or 0):.1f}%"
+    rows_html = f"""<tr style='background:#F0F9FF;font-size:11px;color:#374151'>
+  <td style='font-weight:800;color:#1F3A5F;white-space:nowrap'>🎯 יעד מבוקש</td>
+  <td style='color:#6B7280;font-size:10px'>הגדרות הבקשה</td>
+  <td class='num' style='color:#1F3A5F;font-weight:700'>{_tpct("stocks")}</td>
+  <td class='num' style='color:#1F3A5F;font-weight:700'>{_tpct("foreign")}</td>
+  <td class='num' style='color:#1F3A5F;font-weight:700'>{_tpct("fx")}</td>
+  <td class='num' style='color:#1F3A5F;font-weight:700'>{_tpct("illiquid")}</td>
+  <td class='num'>—</td>
+  <td class='num'>—</td>
+  <td class='num'>—</td>
+</tr>"""
+
+    for rrow in rows:
+        label = rrow["חלופה"]
+        is_sel = (label == selected_alt)
+        sel_cls = " class='sel-row'" if is_sel else ""
+        icon = "✔ " if is_sel else ""
+        name_style = "font-weight:800;color:#1F3A5F;cursor:pointer;text-decoration:underline dotted #93C5FD"
+
+        tracks_cell = tracks_with_weights_html(rrow)
+
+        sharpe_v = rrow.get("שארפ משוקלל","—")
+        if rrow.get("sharpe_incomplete") or (isinstance(sharpe_v, float) and math.isnan(sharpe_v)):
+            sharpe_cell = "<td class='num' style='font-size:9px;color:#92400e'>—*</td>"
+        else:
+            sharpe_cell = f"<td class='num'>{fmt_val(rrow, 'שארפ משוקלל', False, 2)}</td>"
+
+        # weighted ret_12m for this alternative
+        _row_items = rrow.get("weights_items") or []
+        _r12 = _weighted_metric_from_items(_row_items, df_active, "ret_12m")
+        ret12_cell = f"<td class='num'>{_r12:.2f}%</td>" if not math.isnan(_r12) else "<td class='num'>—</td>"
+
+        rows_html += f"""<tr{sel_cls}>
+  <td style='{name_style}'>{icon}{_esc(label)}</td>
+  <td style='font-size:11px;line-height:1.9'>{tracks_cell}</td>
+  <td class='num'>{fmt_val(rrow,'מניות (%)')}</td>
+  <td class='num'>{fmt_val(rrow,'חו"ל (%)')}</td>
+  <td class='num'>{fmt_val(rrow,'מט"ח (%)')}</td>
+  <td class='num'>{fmt_val(rrow,'לא־סחיר (%)')}</td>
+  {sharpe_cell}
+  <td class='num'>{fmt_val(rrow,'שירות משוקלל',False,0) if not rrow.get("service_missing") else "<span style='font-size:9px;color:#92400e'>—*</span>"}</td>
+  {ret12_cell}
+</tr>"""
+
+    st.markdown(f"""
+<div style='overflow-x:auto;border:1px solid #E5EAF2;border-radius:10px;overflow:hidden;margin-bottom:4px'>
+  <table class='res-tbl'>
+    <thead><tr>{header_cells}</tr></thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+</div>
+<p style='font-size:10px;color:#9CA3AF;margin:2px 0 6px'>
+  לחץ על שם החלופה לפרטים וסטטיסטיקה &nbsp;|&nbsp; * שארפ חסר — לא כל המסלולים פרסמו שארפ &nbsp;|&nbsp; * שירות — ציון לא נמצא לגוף
+</p>
+""", unsafe_allow_html=True)
+
+    # Fix 7: Alt NAME as Streamlit button → opens detail panel (replaces separate row of buttons)
+    sel_cols = st.columns(len(rows))
+    for col, rrow in zip(sel_cols, rows):
+        with col:
+            label = rrow["חלופה"]
+            is_sel = (label == selected_alt)
+            if st.button(
+                f"{'✔ ' if is_sel else '📊 '}{label}",
+                use_container_width=True,
+                type="primary" if is_sel else "secondary",
+                key=f"sel2_{label}"
+            ):
+                if is_sel:
+                    st.session_state["selected_alt"] = None
+                else:
+                    st.session_state["selected_alt"] = label
+                    st.session_state["show_vote_stats"] = False  # close stats panel on new selection
+                    if voting_configured:
+                        ok = _write_vote(label, str(rrow.get("מנהלים","")), str(rrow.get("מסלולים","")))
+                        if ok:
+                            try: _load_votes_cached.clear()
+                            except: pass
+                st.rerun()
+
+    # Inline detail + lazy stats for selected row
+    if selected_alt:
+        sel_row = next((r for r in rows if r["חלופה"] == selected_alt), None)
+        if sel_row:
+            items = sel_row.get("weights_items") or _weights_items(
+                sel_row.get("weights"), sel_row.get("קופות",""), sel_row.get("מסלולים",""), sel_row.get("מנהלים_רשימה",""))
+            st.markdown(f"""
+<div style='background:#EFF6FF;border:1.5px solid #C7D7FF;border-radius:10px;
+padding:12px 16px;margin:6px 0'>
+<div style='font-size:13px;font-weight:800;color:#1F3A5F;margin-bottom:8px'>
+  📊 {_esc(selected_alt)} — פרטים
+</div>""", unsafe_allow_html=True)
+
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                st.metric("מניות",  _pct(sel_row.get("מניות (%)","—")))
+                st.metric('חו"ל',   _pct(sel_row.get('חו"ל (%)',"—")))
+            with d2:
+                st.metric('מט"ח',   _pct(sel_row.get('מט"ח (%)',"—")))
+                sv = sel_row.get("שארפ משוקלל","—")
+                if sel_row.get("sharpe_incomplete") or (isinstance(sv,float) and math.isnan(sv)):
+                    st.metric("שארפ", "—")
+                    st.caption("⚠️ לא כל המסלולים פרסמו שארפ")
+                else:
+                    st.metric("שארפ", _num(sv, 2))
+            with d3:
+                st.metric("לא-סחיר", _pct(sel_row.get("לא־סחיר (%)","—")))
+                st.metric("שירות ואיכות",   _num(sel_row.get("שירות משוקלל","—"), 0))
+
+            if items:
+                with st.expander(f"📋 פרמטרים לכל קרן בחלופה — {selected_alt}", expanded=True):
+                    for it in items:
+                        fund_name = str(it.get("fund", "")).strip()
+                        pct_str   = str(it.get("pct", "")).strip()
+                        track     = str(it.get("track", "")).strip()
+                        manager   = str(it.get("manager", "")).strip()
+                        match = df_active[df_active["fund"].str.strip() == fund_name]
+                        st.markdown(
+                            f"<div style='font-size:13px;font-weight:700;color:#1F3A5F;"
+                            f"margin-bottom:4px'>{_esc(pct_str)} — {_esc(fund_name)}"
+                            f"<span style='font-size:11px;font-weight:400;color:#6B7280'>"
+                            f" &nbsp;|&nbsp; {_esc(track)}"
+                            f"{' &nbsp;|&nbsp; ' + _esc(manager) if manager else ''}"
+                            f"</span></div>",
+                            unsafe_allow_html=True
+                        )
+                        if not match.empty:
+                            r = match.iloc[0]
+                            fc1, fc2, fc3, fc4, fc5, fc6 = st.columns(6)
+                            fc1.metric("מניות",    _pct(r.get("stocks",   "—")))
+                            fc2.metric('חו"ל',     _pct(r.get("foreign",  "—")))
+                            fc3.metric('מט"ח',     _pct(r.get("fx",       "—")))
+                            fc4.metric("לא-סחיר",  _pct(r.get("illiquid", "—")))
+                            fc5.metric("תשואה 12מ", _pct(r.get("ret_12m", "—")))
+                            sh = r.get("sharpe", None)
+                            fc6.metric("שארפ", _num(sh, 2) if sh and not (isinstance(sh, float) and math.isnan(sh)) else "—")
+                        else:
+                            st.caption("אין נתונים זמינים לקרן זו")
+                        st.markdown("<hr style='margin:6px 0;border:none;border-top:0.5px solid #E5EAF2'>", unsafe_allow_html=True)
+
+            if baseline:
+                delta_parts = []
+                for lbl, bl_key, row_key, lower in [
+                    ("מניות","stocks","מניות (%)",False), ('חו"ל',"foreign",'חו"ל (%)',False),
+                    ("שארפ","sharpe","שארפ משוקלל",False), ("שירות ואיכות","service","שירות משוקלל",False),
+                ]:
+                    try:
+                        cur = float(baseline.get(bl_key, 0))
+                        new = float(sel_row.get(row_key, 0))
+                        diff = new - cur
+                        if abs(diff) < 0.05: continue
+                        good = (diff > 0 and not lower) or (diff < 0 and lower)
+                        clr  = "#15A46E" if good else "#DC2626"
+                        sign = "+" if diff >= 0 else ""
+                        delta_parts.append(f"<span style='color:{clr}'>{lbl}: {sign}{diff:.1f}</span>")
+                    except: pass
+                if delta_parts:
+                    st.markdown("**Δ** מול מצב קיים: " + " &nbsp;|&nbsp; ".join(delta_parts), unsafe_allow_html=True)
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            # ── Weighted returns table for selected alternative ──
+            _ret_items = sel_row.get("weights_items") or _weights_items(
+                sel_row.get("weights"), sel_row.get("קופות",""), sel_row.get("מסלולים",""), sel_row.get("מנהלים_רשימה",""))
+            _wr = _compute_weighted_returns_for_items(_ret_items, df_active)
+            def _fp(v): return f"{v:.2f}%" if not math.isnan(v) else "—"
+            _ret_rows = [
+                ("תשואה מתחילת השנה",                   _fp(_wr["ret_ytd"])),
+                ("תשואה מצטברת 12 חודשים אחרונים",      _fp(_wr["ret_12m"])),
+                ("תשואה מצטברת 36 חודשים אחרונים",      _fp(_wr["ret_36m"])),
+                ("תשואה מצטברת 60 חודשים אחרונים",      _fp(_wr["ret_60m"])),
+            ]
+            _ret_html = "".join(
+                f"<tr><td style='padding:5px 10px;font-size:12px'>{_esc(lbl)}</td>"
+                f"<td style='padding:5px 10px;font-size:12px;font-weight:700;text-align:center'>{_esc(val)}</td></tr>"
+                for lbl, val in _ret_rows
+            )
+            st.markdown(f"""
+<div style='margin:8px 0 6px'>
+<div style='font-size:12px;font-weight:800;color:#1F3A5F;margin-bottom:4px'>📈 תשואות משוקללות — החלופה הנבחרת</div>
+<table style='width:100%;border-collapse:collapse;border:1px solid #C7D7FF;border-radius:8px;overflow:hidden;direction:rtl'>
+  <thead><tr style='background:#1F3A5F'>
+    <th style='padding:6px 10px;color:#F0F4FF;font-size:11.5px;text-align:right'>מדד</th>
+    <th style='padding:6px 10px;color:#F0F4FF;font-size:11.5px;text-align:center'>תשואה משוקללת</th>
+  </tr></thead>
+  <tbody>{_ret_html}</tbody>
+</table>
+</div>
+""", unsafe_allow_html=True)
+
+            # Voting stats – always show button; session_state flag persists across reruns
+            show_key = "show_vote_stats"
+            if st.button("📊 סטטיסטיקות בחירה קהילתית", key="show_stats_btn"):
+                st.session_state[show_key] = not st.session_state.get(show_key, False)
+                st.rerun()
+            if st.session_state.get(show_key, False):
+                if voting_configured:
+                    _render_votes_stats()
+                else:
+                    st.info(
+                        "📋 **הסטטיסטיקה זמינה רק לאחר הגדרת חיבור ל-Google Sheets.**\n\n"
+                        "הוסף את פרטי ה-GCP Service Account לסודות האפליקציה ב-Streamlit Cloud:\n"
+                        "`Settings → Secrets → הדבק את תוכן קובץ ה-JSON תחת [gcp_service_account]`\n\n"
+                        "ראה קובץ `SETUP_VOTING.md` בפרויקט להוראות מלאות."
+                    )
+
+
+# ── FUND COMPARISON SECTION ─────────────────────────────────────────
+def render_fund_comparison(df_active, all_funds_list):
+    # If quick filter was just selected, auto-open and inject scroll anchor
+    scroll_flag = st.session_state.pop("_qf_scroll_to_cmp", False)
+    if scroll_flag:
+        st.markdown("""
+<div id="cmp-anchor" style="height:0;overflow:hidden"></div>
+<script>
+  setTimeout(function(){
+    var el = window.parent.document.getElementById('cmp-anchor');
+    if(el){ el.scrollIntoView({behavior:'smooth', block:'start'}); }
+  }, 200);
+</script>""", unsafe_allow_html=True)
+
+    # auto-expand when quick filter active
+    qp = st.session_state.get("quick_profile_active")
+    auto_open = bool(qp)
+
+    with st.expander("⚖️ השוואת מסלולי השקעה", expanded=auto_open):
+        st.caption("בחר עד 10 מסלולים להשוואה – נתוני חשיפות, שארפ וציון שירות.")
+
+        qp = st.session_state.get("quick_profile_active")
+        if qp and qp in QUICK_PROFILES_NEW:
+            pf = QUICK_PROFILES_NEW[qp]
+            filt = df_active.copy()
+            # Use fillna(0) for filter comparisons only — stored values are untouched
+            if "stocks_min"  in pf: filt = filt[filt["stocks"].fillna(0)   >= pf["stocks_min"]]
+            if "stocks_max"  in pf: filt = filt[filt["stocks"].fillna(0)   <= pf["stocks_max"]]
+            if "foreign_min" in pf: filt = filt[filt["foreign"].fillna(0)  >= pf["foreign_min"]]
+            if "foreign_max" in pf: filt = filt[filt["foreign"].fillna(0)  <= pf["foreign_max"]]
+            if "fx_min"      in pf: filt = filt[filt["fx"].fillna(0)       >= pf["fx_min"]]
+            if "illiquid_max"in pf: filt = filt[filt["illiquid"].fillna(0) <= pf["illiquid_max"]]
+            if "track_contains" in pf:
+                filt = filt[filt["track"].astype(str).str.contains(pf["track_contains"], na=False)]
+            if "track_exact" in pf:
+                filt = filt[filt["track"].astype(str).str.strip() == pf["track_exact"]]
+            if "track_exact_word" in pf:
+                # רק מסלולים ששמם מכיל את המילה "כללי" (case-insensitive)
+                word = pf["track_exact_word"]
+                filt = filt[filt["track"].astype(str).str.contains(rf'(?<![^\s]){word}(?![^\s])', na=False, regex=True) |
+                            filt["track"].astype(str).str.contains(word, na=False)]
+            all_tracks = sorted(filt["track"].unique().tolist())
+            # Count and table both derive from the same `filt` — no secondary truncation below
+            st.info(f"פילטר פעיל: **{qp}** — {len(filt)} קרנות")
+        else:
+            filt = df_active
+            all_tracks = sorted(df_active["track"].unique().tolist())
+
+        ca, cb = st.columns(2)
+        with ca:
+            compare_tracks = st.multiselect("🔍 לפי מסלול", all_tracks, placeholder="הקלד שם...", key="cmp_tracks")
+        with cb:
+            compare_funds = st.multiselect("🔍 לפי קרן", all_funds_list, placeholder="הקלד שם...", max_selections=10, key="cmp_funds")
+
+        selected_rows = []
+        for track in (compare_tracks or []):
+            for _, row in filt[filt["track"]==track].sort_values("sharpe",ascending=False).iterrows():
+                selected_rows.append(row)
+        for fn in (compare_funds or []):
+            rows = filt[filt["fund"]==fn]
+            if not rows.empty: selected_rows.append(rows.iloc[0])
+
+        if qp and not compare_tracks and not compare_funds:
+            # Bug was here: .head(15) caused count (len(filt)) to differ from displayed rows.
+            # Removed .head(15) so all filt rows are shown. Sort by service descending.
+            for _, row in filt.sort_values("service", ascending=False).iterrows():
+                selected_rows.append(row)
+
+        seen = set(); unique_rows = []
+        for r in selected_rows:
+            k = str(r["fund"])
+            if k not in seen: seen.add(k); unique_rows.append(r)
+
+        if not unique_rows:
+            st.info("בחר מסלול או קרן להצגה")
+            return
+
+        comp_data = []
+        for r in unique_rows:
+            comp_data.append({
+                "קרן":              str(r.get("fund","")),
+                "מסלול":            str(r.get("track","")),
+                "מנהל":             str(r.get("manager","")),
+                'חו"ל (%)':         r.get("foreign",  float("nan")),
+                "מניות (%)":        r.get("stocks",   float("nan")),
+                'מט"ח (%)':         r.get("fx",       float("nan")),
+                "לא־סחיר (%)":      r.get("illiquid", float("nan")),
+                "שארפ":             r.get("sharpe",   float("nan")),
+                "שירות ואיכות":     r.get("service",  float("nan")),
+                "תשואה 12 חודשים":  r.get("ret_12m",  float("nan")),
+            })
+        comp_df = pd.DataFrame(comp_data)
+        num_cols = ['חו"ל (%)','מניות (%)', 'מט"ח (%)','לא־סחיר (%)','שארפ','שירות', 'תשואה 12 חודשים']
+
+        header_h = "".join(f"<th>{c}</th>" for c in comp_df.columns)
+        rows_h = ""
+        for _, row in comp_df.iterrows():
+            cells = ""
+            for col in comp_df.columns:
+                v = row[col]
+                if col in num_cols:
+                    try:
+                        f = float(v)
+                        if math.isnan(f):
+                            cells += "<td style='text-align:center'>—</td>"
+                        else:
+                            dec  = 2 if col in ("שארפ", "תשואה 12 חודשים") else (0 if col == "שירות ואיכות" else 1)
+                            unit = "%" if ("%" in col or col == "תשואה 12 חודשים") else ""
+                            cells += f"<td style='text-align:center'>{f:.{dec}f}{unit}</td>"
+                    except:
+                        cells += "<td style='text-align:center'>—</td>"
+                else:
+                    cells += f"<td>{_esc(str(v))}</td>"
+            rows_h += f"<tr>{cells}</tr>"
+
+        st.markdown(f"""
+<div style='overflow-x:auto;border:1px solid #E5EAF2;border-radius:10px;overflow:hidden'>
+  <table class='res-tbl'>
+    <thead><tr>{header_h}</tr></thead>
+    <tbody>{rows_h}</tbody>
+  </table>
+</div>""", unsafe_allow_html=True)
+
+        # Compact bar chart for one metric
+        bar_metric = st.selectbox("הצג גרף:", num_cols, key="cmp_bar2")
+        bar_df = comp_df[["קרן", bar_metric]].dropna().sort_values(bar_metric, ascending=False)
+        if not bar_df.empty:
+            colors = ["#3A7AFE"] * len(bar_df)
+            if len(bar_df) > 1:
+                colors[0] = "#15A46E"; colors[-1] = "#EF4444"
+            unit = "%" if "%" in bar_metric else ""
+            fig = go.Figure(go.Bar(
+                x=bar_df["קרן"], y=bar_df[bar_metric],
+                marker_color=colors,
+                text=bar_df[bar_metric].apply(lambda v: f"{v:.1f}{unit}"),
+                textposition="outside",
+            ))
+            fig.update_layout(
+                height=240, margin=dict(t=15,b=60,l=5,r=5),
+                xaxis=dict(tickangle=-30, tickfont=dict(size=10)),
+                yaxis=dict(showgrid=True, gridcolor="#F1F5F9"),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            )
+            _safe_plotly(fig, key="cmp_bar_fig")
+
+        cmp_out = io.BytesIO()
+        with pd.ExcelWriter(cmp_out, engine="openpyxl") as writer:
+            comp_df.to_excel(writer, sheet_name="השוואה", index=False)
+        st.download_button("⬇️ ייצוא לאקסל", data=cmp_out.getvalue(),
+            file_name="fund_comparison.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="cmp_dl")
+
+
+# ── HISTORY SECTION ─────────────────────────────────────────────────
+def render_history():
+    history = st.session_state.get("run_history", [])
+    if not history:
+        return
+    with st.expander("🕓 היסטוריית חישובים", expanded=False):
+        for i, h in enumerate(history):
+            ts = h.get("ts","")
+            df_h = h.get("solutions_all")
+            if df_h is None or df_h.empty: continue
+            n = len(df_h)
+            tgts = h.get("targets", {})
+            tgt_str = " | ".join(f"{k}: {v:.0f}%" for k,v in tgts.items() if v)
+            st.markdown(f"**{ts}** — {n:,} פתרונות | {tgt_str}")
+            if i < len(history) - 1: st.markdown("---")
+
+
+# ═══════════════════════════════════════════════════════════════════
